@@ -2,7 +2,7 @@ import os
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
-import sqlite3
+import psycopg2
 import time
 from datetime import datetime, timedelta
 import sys
@@ -16,13 +16,19 @@ load_dotenv()
 # ==========================================
 # CONFIGURATION
 # ==========================================
-DB_FILE = "earnings_tracker.db"
+DATABASE_URL = os.getenv("DATABASE_URL") # This will come from Neon.tech
 TELEGRAM_BOT_TOKEN = os.getenv("RESULT_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-CRON_SECRET_KEY = os.getenv("CRON_SECRET_KEY")
+CRON_SECRET_KEY = os.getenv("CRON_SECRET_KEY", "my_super_secret_cron_key_123")
 
 app = Flask(__name__)
 app.secret_key = "super_secret_key_for_flask_flashes"
+
+def get_db_connection():
+    """Connects to the remote PostgreSQL Database"""
+    if not DATABASE_URL:
+        raise ValueError("CRITICAL: DATABASE_URL environment variable is missing.")
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
 # ==========================================
 # 1. AUTO-QUARTER LOGIC
@@ -54,8 +60,10 @@ def matches_target_quarter(headline, target_quarter):
 # DATABASE SETUP & UTILS
 # ==========================================
 def init_db():
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
+    
+    # Create main table if it doesn't exist
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS earnings_tracker (
             Scrip_Code TEXT, Company_Name TEXT, Target_Quarter TEXT, BSE_Announcement_Date TEXT, Headline TEXT,
@@ -64,18 +72,25 @@ def init_db():
             PAT_CQ REAL, PAT_PQ REAL, PAT_YQ REAL, Last_Checked TIMESTAMP, PRIMARY KEY (Scrip_Code, Target_Quarter)
         )
     ''')
-    for col in ['Headline', 'Attachment_Name', 'NSE_Symbol', 'Sales_CQ', 'Sales_PQ', 'Sales_YQ', 
-                'PAT_CQ', 'PAT_PQ', 'PAT_YQ', 'Sales_QoQ', 'PAT_QoQ', 'Margin_QoQ', 
-                'Margin_CQ', 'Margin_PQ', 'Margin_YQ', 'Margin_Name']:
-        try: cursor.execute(f"ALTER TABLE earnings_tracker ADD COLUMN {col} TEXT")
-        except sqlite3.OperationalError: pass 
+    
+    # Safe migrations for columns (PostgreSQL syntax)
+    cols = ['Headline', 'Attachment_Name', 'NSE_Symbol', 'Sales_CQ', 'Sales_PQ', 'Sales_YQ', 
+            'PAT_CQ', 'PAT_PQ', 'PAT_YQ', 'Sales_QoQ', 'PAT_QoQ', 'Margin_QoQ', 
+            'Margin_CQ', 'Margin_PQ', 'Margin_YQ', 'Margin_Name']
+    
+    for col in cols:
+        try:
+            cursor.execute(f"ALTER TABLE earnings_tracker ADD COLUMN IF NOT EXISTS {col} TEXT")
+        except Exception:
+            conn.rollback() # Rollback required in postgres if an error occurs
+
     conn.commit()
     conn.close()
 
 def delete_scrip_from_db(scrip_code):
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = ? OR NSE_Symbol = ?", (str(scrip_code), str(scrip_code)))
+    cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = %s OR NSE_Symbol = %s", (str(scrip_code), str(scrip_code)))
     deleted = cursor.rowcount
     conn.commit()
     conn.close()
@@ -123,7 +138,7 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
     df_results = pd.DataFrame(all_announcements)
     df_results = df_results.drop_duplicates(subset=['ATTACHMENTNAME']).copy()
     
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     added_count = 0
     for index, row in df_results.iterrows():
@@ -131,14 +146,18 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
         headline = str(row["HEADLINE"]); attach = str(row["ATTACHMENTNAME"])
         
         if not matches_target_quarter(headline, TARGET_QUARTER): continue
-        try:
-            cursor.execute('''
-                INSERT INTO earnings_tracker 
-                (Scrip_Code, Company_Name, Target_Quarter, BSE_Announcement_Date, Headline, Attachment_Name, Screener_Status, Telegram_Status, Last_Checked)
-                VALUES (?, ?, ?, ?, ?, ?, 'Pending', 'Unsent', ?)
-            ''', (scrip, name, TARGET_QUARTER, date, headline, attach, datetime.now()))
+        
+        # Postgres uses %s instead of ? and ON CONFLICT to prevent duplicates
+        cursor.execute('''
+            INSERT INTO earnings_tracker 
+            (Scrip_Code, Company_Name, Target_Quarter, BSE_Announcement_Date, Headline, Attachment_Name, Screener_Status, Telegram_Status, Last_Checked)
+            VALUES (%s, %s, %s, %s, %s, %s, 'Pending', 'Unsent', %s)
+            ON CONFLICT (Scrip_Code, Target_Quarter) DO NOTHING
+        ''', (scrip, name, TARGET_QUARTER, date, headline, attach, datetime.now()))
+        
+        if cursor.rowcount > 0:
             added_count += 1
-        except sqlite3.IntegrityError: pass
+
     conn.commit()
     conn.close()
     print(f"Added {added_count} new announcements to tracking queue.")
@@ -317,9 +336,9 @@ def send_to_telegram(message_text, scrip_code, nse_symbol):
 # ==========================================
 def process_pending_results():
     print("Processing pending results...")
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT Scrip_Code, Attachment_Name, Company_Name FROM earnings_tracker WHERE Target_Quarter = ? AND Telegram_Status = 'Unsent'", (TARGET_QUARTER,))
+    cursor.execute("SELECT Scrip_Code, Attachment_Name, Company_Name FROM earnings_tracker WHERE Target_Quarter = %s AND Telegram_Status = 'Unsent'", (TARGET_QUARTER,))
     pending_stocks = cursor.fetchall()
     
     for scrip, attachment, company_name in pending_stocks:
@@ -327,7 +346,7 @@ def process_pending_results():
         if check_screener_for_quarter(data, TARGET_QUARTER):
             if data.get('market_cap', 0) < 500:
                 print(f"⏳ Deleting {scrip}: Market Cap ({data.get('market_cap')} Cr) is below 500 Cr.")
-                cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = ? AND Target_Quarter = ?", (scrip, TARGET_QUARTER))
+                cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = %s AND Target_Quarter = %s", (scrip, TARGET_QUARTER))
                 conn.commit()
                 time.sleep(2)
                 continue
@@ -341,10 +360,10 @@ def process_pending_results():
                     cursor.execute('''
                         UPDATE earnings_tracker 
                         SET Screener_Status = 'Available', Telegram_Status = 'Sent',
-                            Rating = ?, Sales_YoY = ?, PAT_YoY = ?, Margin_Change = ?, Last_Checked = ?, NSE_Symbol = ?,
-                            Sales_CQ = ?, Sales_PQ = ?, Sales_YQ = ?, PAT_CQ = ?, PAT_PQ = ?, PAT_YQ = ?,
-                            Sales_QoQ = ?, PAT_QoQ = ?, Margin_QoQ = ?, Margin_CQ = ?, Margin_PQ = ?, Margin_YQ = ?, Margin_Name = ?
-                        WHERE Scrip_Code = ? AND Target_Quarter = ?
+                            Rating = %s, Sales_YoY = %s, PAT_YoY = %s, Margin_Change = %s, Last_Checked = %s, NSE_Symbol = %s,
+                            Sales_CQ = %s, Sales_PQ = %s, Sales_YQ = %s, PAT_CQ = %s, PAT_PQ = %s, PAT_YQ = %s,
+                            Sales_QoQ = %s, PAT_QoQ = %s, Margin_QoQ = %s, Margin_CQ = %s, Margin_PQ = %s, Margin_YQ = %s, Margin_Name = %s
+                        WHERE Scrip_Code = %s AND Target_Quarter = %s
                     ''', (metrics['Rating'], metrics['Sales_YoY'], metrics['PAT_YoY'], 
                           metrics['Margin_YoY'], datetime.now(), nse_symbol, 
                           metrics.get('Sales_CQ'), metrics.get('Sales_PQ'), metrics.get('Sales_YQ'), 
@@ -354,7 +373,7 @@ def process_pending_results():
                           metrics.get('Margin_Name'), scrip, TARGET_QUARTER))
                     conn.commit()
         else:
-            cursor.execute("UPDATE earnings_tracker SET Last_Checked = ? WHERE Scrip_Code = ? AND Target_Quarter = ?", (datetime.now(), scrip, TARGET_QUARTER))
+            cursor.execute("UPDATE earnings_tracker SET Last_Checked = %s WHERE Scrip_Code = %s AND Target_Quarter = %s", (datetime.now(), scrip, TARGET_QUARTER))
             conn.commit()
         time.sleep(2) 
     conn.close()
@@ -398,7 +417,7 @@ HTML_TEMPLATE = """
     $(document).ready(function() { 
         var table = $('#dataTable').DataTable({"pageLength": 25, "order": [[ 4, "desc" ]]}); 
         
-        // Handle delete button clicks using event delegation
+        // Handle delete button clicks securely
         $('#dataTable tbody').on('click', '.delete-btn', function() {
             var scripCode = $(this).data('scrip');
             var row = $(this).closest('tr');
@@ -406,19 +425,20 @@ HTML_TEMPLATE = """
             if(confirm('Are you sure you want to delete ' + scripCode + '?')) {
                 $.ajax({
                     url: '/api/delete-scrip',
-                    type: 'DELETE',
-                    data: { scrip: scripCode },
+                    type: 'POST',
+                    data: { 
+                        scrip: scripCode,
+                        key: '{{ secret_key }}' // Injected securely via Jinja template
+                    },
                     success: function(result) {
                         if(result.status === 'success') {
                             table.row(row).remove().draw();
-                            // Optional: Show a subtle success message
                         } else {
                             alert('Error: ' + result.message);
                         }
                     },
                     error: function(xhr) {
-                        alert('Error deleting scrip. See console.');
-                        console.error(xhr.responseText);
+                        alert('Error deleting scrip. Unauthorized or invalid key.');
                     }
                 });
             }
@@ -542,17 +562,17 @@ app.jinja_env.loader = ChoiceLoader([DictLoader({'base': HTML_TEMPLATE}), app.ji
 @app.route("/")
 def dashboard():
     init_db()
-    conn = sqlite3.connect(DB_FILE)
+    conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute("""
         SELECT Scrip_Code, Company_Name, BSE_Announcement_Date, Rating, Screener_Status, Telegram_Status, 
                Sales_YoY, PAT_YoY, NSE_Symbol, Sales_CQ, Sales_PQ, Sales_YQ, PAT_CQ, PAT_PQ, PAT_YQ,
                Sales_QoQ, PAT_QoQ, Margin_QoQ, Margin_CQ, Margin_PQ, Margin_YQ, Margin_Name, Margin_Change
-        FROM earnings_tracker WHERE Target_Quarter = ?
+        FROM earnings_tracker WHERE Target_Quarter = %s
     """, (TARGET_QUARTER,))
     rows = cursor.fetchall()
     conn.close()
-    return render_template_string(DASHBOARD_PAGE, rows=rows, target_quarter=TARGET_QUARTER)
+    return render_template_string(DASHBOARD_PAGE, rows=rows, target_quarter=TARGET_QUARTER, secret_key=CRON_SECRET_KEY)
 
 @app.route("/api/trigger-cron", methods=["GET"])
 def trigger_cron():
@@ -560,7 +580,6 @@ def trigger_cron():
     if provided_key != CRON_SECRET_KEY:
         return jsonify({"error": "Unauthorized"}), 401
     
-    # We allow overriding dates through the webhook!
     start_date = request.args.get("start")
     end_date = request.args.get("end")
     
@@ -577,13 +596,13 @@ def trigger_cron():
     msg = f"Pipeline started. Fetching from {start_date or 'yesterday'} to {end_date or 'today'}."
     return jsonify({"status": "success", "message": msg})
 
-@app.route("/api/delete-scrip", methods=["GET","DELETE"])
+@app.route("/api/delete-scrip", methods=["GET", "POST", "DELETE"])
 def api_delete_scrip():
-    provided_key = request.args.get("key")
+    provided_key = request.args.get("key") or request.form.get("key")
     if provided_key != CRON_SECRET_KEY:
         return jsonify({"error": "Unauthorized"}), 401
         
-    scrip_code = request.form.get("scrip")
+    scrip_code = request.args.get("scrip") or request.form.get("scrip")
     if not scrip_code:
          return jsonify({"status": "error", "message": "Scrip code not provided."}), 400
          
