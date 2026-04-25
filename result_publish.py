@@ -6,7 +6,8 @@ import sqlite3
 import time
 from datetime import datetime, timedelta
 import sys
-from flask import Flask, render_template_string
+import threading
+from flask import Flask, render_template_string, request, jsonify
 from jinja2 import DictLoader, ChoiceLoader
 from dotenv import load_dotenv
 
@@ -17,7 +18,8 @@ load_dotenv()
 # ==========================================
 DB_FILE = "earnings_tracker.db"
 TELEGRAM_BOT_TOKEN = os.getenv("RESULT_BOT_TOKEN")
-TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID") # e.g., "@MyEarningsAlerts" or "-100123456789"
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+CRON_SECRET_KEY = os.getenv("CRON_SECRET_KEY", "my_super_secret_cron_key_123") # We will use this in Render
 
 app = Flask(__name__)
 app.secret_key = "super_secret_key_for_flask_flashes"
@@ -26,44 +28,26 @@ app.secret_key = "super_secret_key_for_flask_flashes"
 # 1. AUTO-QUARTER LOGIC
 # ==========================================
 def get_target_quarter():
-    """Automatically determines the current reporting quarter based on today's date."""
     today = datetime.today()
     year = today.year
     month = today.month
     
-    if month in [1, 2, 3]:
-        return f"Dec {year - 1}"
-    elif month in [4, 5, 6]:
-        return f"Mar {year}"
-    elif month in [7, 8, 9]:
-        return f"Jun {year}"
-    else:
-        return f"Sep {year}"
+    if month in [1, 2, 3]: return f"Dec {year - 1}"
+    elif month in [4, 5, 6]: return f"Mar {year}"
+    elif month in [7, 8, 9]: return f"Jun {year}"
+    else: return f"Sep {year}"
 
 TARGET_QUARTER = get_target_quarter()
 
 def matches_target_quarter(headline, target_quarter):
-    """Filters out erroneous announcements by checking if the headline mentions the target quarter/year."""
-    if not headline: 
-        return True
-    
+    if not headline: return True
     hl_lower = headline.lower()
     month, year = target_quarter.split()
-    
-    month_map = {
-        "Mar": ["mar", "03"],
-        "Jun": ["jun", "06"],
-        "Sep": ["sep", "09"],
-        "Dec": ["dec", "12"]
-    }
+    month_map = {"Mar": ["mar", "03"], "Jun": ["jun", "06"], "Sep": ["sep", "09"], "Dec": ["dec", "12"]}
     month_aliases = month_map.get(month, [month.lower()])
-    
     has_month = any(m in hl_lower for m in month_aliases)
     has_year = year in hl_lower
-    
-    if "result" in hl_lower and not (has_month and has_year):
-        return False
-        
+    if "result" in hl_lower and not (has_month and has_year): return False
     return True
 
 # ==========================================
@@ -74,63 +58,35 @@ def init_db():
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS earnings_tracker (
-            Scrip_Code TEXT,
-            Company_Name TEXT,
-            Target_Quarter TEXT,
-            BSE_Announcement_Date TEXT,
-            Headline TEXT,
-            Attachment_Name TEXT,
-            NSE_Symbol TEXT,
-            Screener_Status TEXT,
-            Telegram_Status TEXT,
-            Rating TEXT,
-            Sales_YoY REAL,
-            PAT_YoY REAL,
-            Margin_Change REAL,
-            Sales_CQ REAL,
-            Sales_PQ REAL,
-            Sales_YQ REAL,
-            PAT_CQ REAL,
-            PAT_PQ REAL,
-            PAT_YQ REAL,
-            Last_Checked TIMESTAMP,
-            PRIMARY KEY (Scrip_Code, Target_Quarter)
+            Scrip_Code TEXT, Company_Name TEXT, Target_Quarter TEXT, BSE_Announcement_Date TEXT, Headline TEXT,
+            Attachment_Name TEXT, NSE_Symbol TEXT, Screener_Status TEXT, Telegram_Status TEXT, Rating TEXT,
+            Sales_YoY REAL, PAT_YoY REAL, Margin_Change REAL, Sales_CQ REAL, Sales_PQ REAL, Sales_YQ REAL,
+            PAT_CQ REAL, PAT_PQ REAL, PAT_YQ REAL, Last_Checked TIMESTAMP, PRIMARY KEY (Scrip_Code, Target_Quarter)
         )
     ''')
-    
-    # Safe migrations for all new raw data columns needed for the full table tooltip
     for col in ['Headline', 'Attachment_Name', 'NSE_Symbol', 'Sales_CQ', 'Sales_PQ', 'Sales_YQ', 
                 'PAT_CQ', 'PAT_PQ', 'PAT_YQ', 'Sales_QoQ', 'PAT_QoQ', 'Margin_QoQ', 
                 'Margin_CQ', 'Margin_PQ', 'Margin_YQ', 'Margin_Name']:
-        try:
-            cursor.execute(f"ALTER TABLE earnings_tracker ADD COLUMN {col} TEXT")
-        except sqlite3.OperationalError:
-            pass # Column already exists
-            
+        try: cursor.execute(f"ALTER TABLE earnings_tracker ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError: pass 
     conn.commit()
     conn.close()
 
 def delete_scrip_from_db(scrip_code):
-    """Manually deletes a specific company from the database."""
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
     cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = ? OR NSE_Symbol = ?", (str(scrip_code), str(scrip_code)))
     deleted = cursor.rowcount
     conn.commit()
     conn.close()
-    
-    if deleted > 0:
-        print(f"✅ Successfully removed {scrip_code} from the tracking database.")
-    else:
-        print(f"⚠️ {scrip_code} was not found in the database.")
+    if deleted > 0: print(f"✅ Successfully removed {scrip_code} from the tracking database.")
+    else: print(f"⚠️ {scrip_code} was not found in the database.")
 
 # ==========================================
 # 2. BSE FETCHING LOGIC
 # ==========================================
 def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
-    """Fetches BSE announcements. Defaults to yesterday & today unless dates are provided."""
     print(f"Checking BSE for new announcements (Target Quarter: {TARGET_QUARTER})...")
-    
     if not start_date_str or not end_date_str:
         today = datetime.today()
         yesterday = today - timedelta(days=1)
@@ -144,31 +100,17 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
         "Origin": "https://www.bseindia.com",
         "Referer": "https://www.bseindia.com/"
     }
-    params = {
-        "strCat": "Result",
-        "strPrevDate": start_date_str,
-        "strScrip": "",
-        "strSearch": "P",
-        "strToDate": end_date_str,
-        "strType": "C",
-        "pageno": 1
-    }
-    
+    params = {"strCat": "Result", "strPrevDate": start_date_str, "strScrip": "", "strSearch": "P", "strToDate": end_date_str, "strType": "C", "pageno": 1}
     all_announcements = []
     
     with requests.Session() as session:
         session.get("https://www.bseindia.com/", headers=headers)
-        
         while True:
-            print(f"Fetching BSE page {params['pageno']} for dates {start_date_str} to {end_date_str}...")
             response = session.get(url, headers=headers, params=params)
-            
             if response.status_code != 200: break
             try: data = response.json()
             except requests.exceptions.JSONDecodeError: break
-                
             if not data or 'Table' not in data or len(data['Table']) == 0: break
-                
             all_announcements.extend(data['Table'])
             params["pageno"] += 1
             time.sleep(1)
@@ -182,18 +124,12 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
     
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     added_count = 0
     for index, row in df_results.iterrows():
-        scrip = str(row["SCRIP_CD"])
-        name = str(row["SLONGNAME"])
-        date = str(row["NEWS_DT"])
-        headline = str(row["HEADLINE"])
-        attach = str(row["ATTACHMENTNAME"])
+        scrip = str(row["SCRIP_CD"]); name = str(row["SLONGNAME"]); date = str(row["NEWS_DT"])
+        headline = str(row["HEADLINE"]); attach = str(row["ATTACHMENTNAME"])
         
-        if not matches_target_quarter(headline, TARGET_QUARTER):
-            continue
-            
+        if not matches_target_quarter(headline, TARGET_QUARTER): continue
         try:
             cursor.execute('''
                 INSERT INTO earnings_tracker 
@@ -201,9 +137,7 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
                 VALUES (?, ?, ?, ?, ?, ?, 'Pending', 'Unsent', ?)
             ''', (scrip, name, TARGET_QUARTER, date, headline, attach, datetime.now()))
             added_count += 1
-        except sqlite3.IntegrityError:
-            pass # Already exists
-            
+        except sqlite3.IntegrityError: pass
     conn.commit()
     conn.close()
     print(f"Added {added_count} new announcements to tracking queue.")
@@ -212,14 +146,11 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
 # 3. SCREENER SCRAPING (IN-MEMORY)
 # ==========================================
 def scrape_screener(ticker_code):
-    """Scrapes Screener.in and returns data directly into memory. No saving to disk."""
     url = f"https://www.screener.in/company/{ticker_code}/"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
     try:
         response = requests.get(url, headers=headers, timeout=15)
         if response.status_code != 200: return None
-        
         soup = BeautifulSoup(response.text, 'html.parser')
         data = {"ticker_bse": ticker_code, "last_scraped": str(pd.Timestamp.now())}
 
@@ -230,10 +161,8 @@ def scrape_screener(ticker_code):
             top_links = soup.find('div', class_='company-links')
             if top_links:
                 nse_span = top_links.find('span', string=lambda t: t and 'NSE' in t)
-                if nse_span:
-                    data['nse_symbol'] = nse_span.text.replace('NSE:', '').strip()
-        except Exception:
-            data['nse_symbol'] = None
+                if nse_span: data['nse_symbol'] = nse_span.text.replace('NSE:', '').strip()
+        except Exception: data['nse_symbol'] = None
 
         try:
             mcap = 0.0
@@ -246,9 +175,7 @@ def scrape_screener(ticker_code):
                         mcap = float(num_span.text.replace(',', '').strip())
                         break
             data['market_cap'] = mcap
-        except Exception as e:
-            print(f"[{ticker_code}] Error parsing Market Cap: {e}")
-            data['market_cap'] = 0.0
+        except Exception: data['market_cap'] = 0.0
 
         sections = ['quarters', 'profit-loss', 'balance-sheet', 'cash-flow', 'ratios', 'shareholding']
         for sid in sections:
@@ -259,11 +186,8 @@ def scrape_screener(ticker_code):
                     headers = [th.text.strip() for th in table.find_all('th') if th.text.strip()]
                     rows = [[td.text.strip() for td in tr.find_all('td')] for tr in table.find_all('tr') if tr.find_all('td')]
                     data[f'{sid}_table'] = {"headers": headers, "rows": rows}
-        
         return data 
-    except Exception as e:
-        print(f"[{ticker_code}] Error scraping: {e}")
-        return None
+    except Exception: return None
 
 def check_screener_for_quarter(data, target_quarter):
     if not data or 'quarters_table' not in data: return False
@@ -285,12 +209,7 @@ def evaluate_financials(data):
     CQ_idx = -1; PQ_idx = -2; YQ_idx = -5 
     
     metrics = {'Company': data.get('company_name', 'Unknown'), 'Quarter': headers[CQ_idx], 'Margin_Name': 'OPM'}
-    
-    # Initialize PBT and Tax explicitly to avoid KeyError if they are missing from the table
-    metrics['PBT_CQ'] = 0.0
-    metrics['PBT_PQ'] = 0.0
-    metrics['PBT_YQ'] = 0.0
-    metrics['Tax_CQ'] = 0.0
+    metrics['PBT_CQ'] = 0.0; metrics['PBT_PQ'] = 0.0; metrics['PBT_YQ'] = 0.0; metrics['Tax_CQ'] = 0.0
     
     for row in rows:
         if not row: continue
@@ -306,7 +225,7 @@ def evaluate_financials(data):
         elif 'Net Profit' in label:
             metrics['PAT_CQ'] = clean_num(row[CQ_idx]); metrics['PAT_PQ'] = clean_num(row[PQ_idx]); metrics['PAT_YQ'] = clean_num(row[YQ_idx])
         elif 'Tax %' in label:
-             metrics['Tax_CQ'] = clean_num(row[CQ_idx])
+            metrics['Tax_CQ'] = clean_num(row[CQ_idx])
             
     def calc_growth(current, past):
         if past == 0: return 100.0 if current > 0 else 0.0
@@ -320,7 +239,6 @@ def evaluate_financials(data):
     margin_yoy = metrics.get('Margin_CQ', 0) - metrics.get('Margin_YQ', 0) 
     margin_qoq = metrics.get('Margin_CQ', 0) - metrics.get('Margin_PQ', 0)
     
-    # Precise rating logic based on the 8-point system
     count = 0
     if sales_yoy > 20: count += 1
     if sales_qoq > -10: count += 1
@@ -332,30 +250,22 @@ def evaluate_financials(data):
     if metrics.get('PAT_CQ', 0) > 0: count += 1
     if pat_yoy > 20: count += 1
     
-    if count >= 8:
-        rating = "Excellent"
-    elif sales_yoy > 10 and sales_qoq > -25 and margin_yoy >= -20 and pbt_yoy > 10 and pat_yoy > 10:
-        rating = "Good"
-    elif sales_yoy > -5 and margin_yoy >= -20 and pbt_yoy > -5 and pat_yoy > -5:
-        rating = "Flat"
-    else:
-        rating = "Bad"
+    if count >= 8: rating = "Excellent"
+    elif sales_yoy > 10 and sales_qoq > -25 and margin_yoy >= -20 and pbt_yoy > 10 and pat_yoy > 10: rating = "Good"
+    elif sales_yoy > -5 and margin_yoy >= -20 and pbt_yoy > -5 and pat_yoy > -5: rating = "Flat"
+    else: rating = "Bad"
         
     metrics.update({
-        "Sales_YoY": sales_yoy, "Sales_QoQ": sales_qoq,
-        "PAT_YoY": pat_yoy, "PAT_QoQ": pat_qoq,
-        "Margin_YoY": margin_yoy, "Margin_QoQ": margin_qoq,
-        "Rating": rating
+        "Sales_YoY": sales_yoy, "Sales_QoQ": sales_qoq, "PAT_YoY": pat_yoy, "PAT_QoQ": pat_qoq,
+        "Margin_YoY": margin_yoy, "Margin_QoQ": margin_qoq, "Rating": rating
     })
     return metrics
 
 def format_telegram_alert(metrics_dict, company_name, nse_symbol, attachment_name):
     rating = metrics_dict.get('Rating', 'Unknown')
     summaries = {
-        "Excellent": "Outstanding performance this quarter! 🚀",
-        "Good": "A solid and steady quarter! 👍",
-        "Flat": "Performance remained flat this quarter. ⚖️",
-        "Bad": "Challenging quarter with declining metrics. ⚠️"
+        "Excellent": "Outstanding performance this quarter! 🚀", "Good": "A solid and steady quarter! 👍",
+        "Flat": "Performance remained flat this quarter. ⚖️", "Bad": "Challenging quarter with declining metrics. ⚠️"
     }
     summary = summaries.get(rating, "Results announced for this quarter.")
     
@@ -365,11 +275,10 @@ def format_telegram_alert(metrics_dict, company_name, nse_symbol, attachment_nam
         return f"🟢 ▲ {val:.1f}%" if val >= 0 else f"🔴 ▼ {abs(val):.1f}%"
 
     margin_label = metrics_dict.get('Margin_Name', 'OPM')
-    
     display_name = nse_symbol if nse_symbol else company_name
     pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attachment_name}" if attachment_name else "#"
 
-    message = f"""🏢 <b><a href="{pdf_link}">{display_name}</a></b> | <b>{rating.upper()}</b> Results!
+    return f"""🏢 <b><a href="{pdf_link}">{display_name}</a></b> | <b>{rating.upper()}</b> Results!
 
 <b>Sales:</b> {fmt(metrics_dict.get('Sales_CQ'))}
 <i>(YoY: {fmt_trend(metrics_dict.get('Sales_YoY'))} | QoQ: {fmt_trend(metrics_dict.get('Sales_QoQ'))})</i>
@@ -381,20 +290,15 @@ def format_telegram_alert(metrics_dict, company_name, nse_symbol, attachment_nam
 <i>(YoY: {fmt_trend(metrics_dict.get('Margin_YoY'))} | QoQ: {fmt_trend(metrics_dict.get('Margin_QoQ'))})</i>
 
 {summary} #FinancialAlert"""
-    return message
 
 def send_to_telegram(message_text, scrip_code, nse_symbol):
-    if not TELEGRAM_CHANNEL_ID:
-        print("⚠️ No TELEGRAM_CHANNEL_ID configured. Message not sent.")
-        return False
-        
+    if not TELEGRAM_CHANNEL_ID: return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    
     ticker = nse_symbol if nse_symbol else scrip_code
     screener_url = f"https://www.screener.in/company/{ticker}/"
     full_text = message_text + f"\n\n🔗 <a href='{screener_url}'>Check details on Screener</a>"
     
-    payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": full_text, "parse_mode": "HTML"}
+    payload = {"chat_id": TELEGRAM_CHANNEL_ID, "text": full_text, "parse_mode": "HTML", "disable_web_page_preview": True}
     try:
         response = requests.post(url, json=payload)
         if response.status_code == 200:
@@ -414,15 +318,12 @@ def process_pending_results():
     print("Processing pending results...")
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    
     cursor.execute("SELECT Scrip_Code, Attachment_Name, Company_Name FROM earnings_tracker WHERE Target_Quarter = ? AND Telegram_Status = 'Unsent'", (TARGET_QUARTER,))
     pending_stocks = cursor.fetchall()
     
     for scrip, attachment, company_name in pending_stocks:
         data = scrape_screener(scrip)
-        
         if check_screener_for_quarter(data, TARGET_QUARTER):
-            
             if data.get('market_cap', 0) < 500:
                 print(f"⏳ Deleting {scrip}: Market Cap ({data.get('market_cap')} Cr) is below 500 Cr.")
                 cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = ? AND Target_Quarter = ?", (scrip, TARGET_QUARTER))
@@ -449,19 +350,16 @@ def process_pending_results():
                           metrics.get('PAT_CQ'), metrics.get('PAT_PQ'), metrics.get('PAT_YQ'), 
                           metrics.get('Sales_QoQ'), metrics.get('PAT_QoQ'), metrics.get('Margin_QoQ'),
                           metrics.get('Margin_CQ'), metrics.get('Margin_PQ'), metrics.get('Margin_YQ'),
-                          metrics.get('Margin_Name'),
-                          scrip, TARGET_QUARTER))
+                          metrics.get('Margin_Name'), scrip, TARGET_QUARTER))
                     conn.commit()
         else:
-            cursor.execute("UPDATE earnings_tracker SET Last_Checked = ? WHERE Scrip_Code = ? AND Target_Quarter = ?", 
-                           (datetime.now(), scrip, TARGET_QUARTER))
+            cursor.execute("UPDATE earnings_tracker SET Last_Checked = ? WHERE Scrip_Code = ? AND Target_Quarter = ?", (datetime.now(), scrip, TARGET_QUARTER))
             conn.commit()
-            
         time.sleep(2) 
     conn.close()
 
 # ==========================================
-# 6. FLASK WEB UI DASHBOARD
+# 6. FLASK WEB UI DASHBOARD & WEBHOOKS
 # ==========================================
 HTML_TEMPLATE = """
 <!DOCTYPE html>
@@ -475,61 +373,27 @@ HTML_TEMPLATE = """
     <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
     <script src="https://cdn.datatables.net/1.13.6/js/jquery.dataTables.min.js"></script>
     <style>
-        /* Tooltip styling fixed for center of screen */
-        .tooltip {
-            display: inline-block;
-            cursor: help;
-        }
+        .tooltip { display: inline-block; cursor: help; position: relative; }
         .tooltip .tooltiptext {
-            visibility: hidden;
-            width: max-content;
-            min-width: 400px;
-            background-color: #1f2937;
-            color: #fff;
-            text-align: left;
-            border-radius: 8px;
-            padding: 16px;
-            /* Center of the viewport styling */
-            position: fixed;
-            z-index: 9999;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            opacity: 0;
-            transition: opacity 0.2s ease-in-out;
-            font-size: 0.95rem;
-            font-weight: normal;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5), 0 10px 15px -3px rgba(0, 0, 0, 0.3);
-            pointer-events: none;
+            visibility: hidden; width: max-content; min-width: 400px;
+            background-color: #1f2937; color: #fff; text-align: left; border-radius: 8px; padding: 16px;
+            position: fixed; z-index: 9999; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            opacity: 0; transition: opacity 0.2s ease-in-out; font-size: 0.95rem; font-weight: normal;
+            box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5), 0 10px 15px -3px rgba(0,0,0,0.3); pointer-events: none;
         }
-        .tooltip:hover .tooltiptext {
-            visibility: visible;
-            opacity: 1;
-        }
+        .tooltip:hover .tooltiptext { visibility: visible; opacity: 1; }
     </style>
 </head>
 <body class="bg-gray-100 min-h-screen">
     <nav class="bg-blue-800 text-white p-4 shadow-md">
         <div class="max-w-7xl mx-auto flex justify-between items-center">
             <h1 class="text-2xl font-bold">📈 Earnings Tracker</h1>
-            <div>
-                <a href="/" class="px-3 hover:text-blue-200">Dashboard</a>
-            </div>
         </div>
     </nav>
-
     <div class="max-w-7xl mx-auto mt-8 p-6 bg-white rounded-lg shadow-md">
         {% block content %}{% endblock %}
     </div>
-
-    <script>
-        $(document).ready(function() {
-            $('#dataTable').DataTable({
-                "pageLength": 25,
-                "order": [[ 4, "desc" ]] 
-            });
-        });
-    </script>
+    <script>$(document).ready(function() { $('#dataTable').DataTable({"pageLength": 25, "order": [[ 4, "desc" ]]}); });</script>
 </body>
 </html>
 """
@@ -559,18 +423,12 @@ DASHBOARD_PAGE = """
                     <div class="tooltip">
                         <span class="border-b border-dotted border-gray-500">{{ row[8] or row[0] }}</span>
                         <div class="tooltiptext">
-                            <div class="mb-3 font-bold text-lg border-b border-gray-600 pb-2">
-                                {{ row[1] }} ({{ row[8] or row[0] }})
-                            </div>
+                            <div class="mb-3 font-bold text-lg border-b border-gray-600 pb-2">{{ row[1] }} ({{ row[8] or row[0] }})</div>
                             <table class="w-full text-left text-gray-200 text-sm">
                                 <thead>
                                     <tr class="border-b border-gray-600">
-                                        <th class="pb-1 pr-3">Metric</th>
-                                        <th class="pb-1 pr-3">CQ</th>
-                                        <th class="pb-1 pr-3">PQ</th>
-                                        <th class="pb-1 pr-3">YQ</th>
-                                        <th class="pb-1 pr-3">QoQ%</th>
-                                        <th class="pb-1">YoY%</th>
+                                        <th class="pb-1 pr-3">Metric</th><th class="pb-1 pr-3">CQ</th><th class="pb-1 pr-3">PQ</th>
+                                        <th class="pb-1 pr-3">YQ</th><th class="pb-1 pr-3">QoQ%</th><th class="pb-1">YoY%</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -580,11 +438,9 @@ DASHBOARD_PAGE = """
                                         <td class="pr-3">{% if row[10] is not none %}{{ row[10] }}{% else %}-{% endif %}</td>
                                         <td class="pr-3">{% if row[11] is not none %}{{ row[11] }}{% else %}-{% endif %}</td>
                                         <td class="pr-3 {% if row[15] is not none and row[15]|float > 0 %}text-green-400{% elif row[15] is not none and row[15]|float < 0 %}text-red-400{% endif %}">
-                                            {% if row[15] is not none %}{{ "%.2f"|format(row[15]|float) }}%{% else %}-{% endif %}
-                                        </td>
+                                            {% if row[15] is not none %}{{ "%.2f"|format(row[15]|float) }}%{% else %}-{% endif %}</td>
                                         <td class="{% if row[6] is not none and row[6]|float > 0 %}text-green-400{% elif row[6] is not none and row[6]|float < 0 %}text-red-400{% endif %}">
-                                            {% if row[6] is not none %}{{ "%.2f"|format(row[6]|float) }}%{% else %}-{% endif %}
-                                        </td>
+                                            {% if row[6] is not none %}{{ "%.2f"|format(row[6]|float) }}%{% else %}-{% endif %}</td>
                                     </tr>
                                     <tr>
                                         <td class="pr-3 py-1 font-semibold text-gray-400">Net Profit</td>
@@ -592,11 +448,9 @@ DASHBOARD_PAGE = """
                                         <td class="pr-3">{% if row[13] is not none %}{{ row[13] }}{% else %}-{% endif %}</td>
                                         <td class="pr-3">{% if row[14] is not none %}{{ row[14] }}{% else %}-{% endif %}</td>
                                         <td class="pr-3 {% if row[16] is not none and row[16]|float > 0 %}text-green-400{% elif row[16] is not none and row[16]|float < 0 %}text-red-400{% endif %}">
-                                            {% if row[16] is not none %}{{ "%.2f"|format(row[16]|float) }}%{% else %}-{% endif %}
-                                        </td>
+                                            {% if row[16] is not none %}{{ "%.2f"|format(row[16]|float) }}%{% else %}-{% endif %}</td>
                                         <td class="{% if row[7] is not none and row[7]|float > 0 %}text-green-400{% elif row[7] is not none and row[7]|float < 0 %}text-red-400{% endif %}">
-                                            {% if row[7] is not none %}{{ "%.2f"|format(row[7]|float) }}%{% else %}-{% endif %}
-                                        </td>
+                                            {% if row[7] is not none %}{{ "%.2f"|format(row[7]|float) }}%{% else %}-{% endif %}</td>
                                     </tr>
                                     <tr>
                                         <td class="pr-3 py-1 font-semibold text-gray-400">{{ row[21] or 'Margin' }}</td>
@@ -604,11 +458,9 @@ DASHBOARD_PAGE = """
                                         <td class="pr-3">{% if row[19] is not none %}{{ "%.1f"|format(row[19]|float) }}%{% else %}-{% endif %}</td>
                                         <td class="pr-3">{% if row[20] is not none %}{{ "%.1f"|format(row[20]|float) }}%{% else %}-{% endif %}</td>
                                         <td class="pr-3 {% if row[17] is not none and row[17]|float > 0 %}text-green-400{% elif row[17] is not none and row[17]|float < 0 %}text-red-400{% endif %}">
-                                            {% if row[17] is not none %}{{ "%.2f"|format(row[17]|float) }}%{% else %}-{% endif %}
-                                        </td>
+                                            {% if row[17] is not none %}{{ "%.2f"|format(row[17]|float) }}%{% else %}-{% endif %}</td>
                                         <td class="{% if row[22] is not none and row[22]|float > 0 %}text-green-400{% elif row[22] is not none and row[22]|float < 0 %}text-red-400{% endif %}">
-                                            {% if row[22] is not none %}{{ "%.2f"|format(row[22]|float) }}%{% else %}-{% endif %}
-                                        </td>
+                                            {% if row[22] is not none %}{{ "%.2f"|format(row[22]|float) }}%{% else %}-{% endif %}</td>
                                     </tr>
                                 </tbody>
                             </table>
@@ -628,24 +480,16 @@ DASHBOARD_PAGE = """
                 <td class="px-4 py-3">{{ row[5] }}</td>
                 <td class="px-4 py-3 whitespace-nowrap">
                     {% if row[6] is not none %}
-                        {% if row[6]|float > 0 %}
-                            <span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[6]|float) }}%</span>
-                        {% elif row[6]|float < 0 %}
-                            <span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[6]|float|abs) }}%</span>
-                        {% else %}
-                            <span class="text-gray-600">{{ "%.2f"|format(row[6]|float) }}%</span>
-                        {% endif %}
+                        {% if row[6]|float > 0 %}<span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[6]|float) }}%</span>
+                        {% elif row[6]|float < 0 %}<span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[6]|float|abs) }}%</span>
+                        {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[6]|float) }}%</span>{% endif %}
                     {% else %}-{% endif %}
                 </td>
                 <td class="px-4 py-3 whitespace-nowrap">
                     {% if row[7] is not none %}
-                        {% if row[7]|float > 0 %}
-                            <span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[7]|float) }}%</span>
-                        {% elif row[7]|float < 0 %}
-                            <span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[7]|float|abs) }}%</span>
-                        {% else %}
-                            <span class="text-gray-600">{{ "%.2f"|format(row[7]|float) }}%</span>
-                        {% endif %}
+                        {% if row[7]|float > 0 %}<span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[7]|float) }}%</span>
+                        {% elif row[7]|float < 0 %}<span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[7]|float|abs) }}%</span>
+                        {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[7]|float) }}%</span>{% endif %}
                     {% else %}-{% endif %}
                 </td>
             </tr>
@@ -656,10 +500,7 @@ DASHBOARD_PAGE = """
 {% endblock %}
 """
 
-app.jinja_env.loader = ChoiceLoader([
-    DictLoader({'base': HTML_TEMPLATE}),
-    app.jinja_env.loader
-])
+app.jinja_env.loader = ChoiceLoader([DictLoader({'base': HTML_TEMPLATE}), app.jinja_env.loader])
 
 @app.route("/")
 def dashboard():
@@ -668,42 +509,45 @@ def dashboard():
     cursor = conn.cursor()
     cursor.execute("""
         SELECT Scrip_Code, Company_Name, BSE_Announcement_Date, Rating, Screener_Status, Telegram_Status, 
-               Sales_YoY, PAT_YoY, NSE_Symbol,
-               Sales_CQ, Sales_PQ, Sales_YQ,
-               PAT_CQ, PAT_PQ, PAT_YQ,
+               Sales_YoY, PAT_YoY, NSE_Symbol, Sales_CQ, Sales_PQ, Sales_YQ, PAT_CQ, PAT_PQ, PAT_YQ,
                Sales_QoQ, PAT_QoQ, Margin_QoQ, Margin_CQ, Margin_PQ, Margin_YQ, Margin_Name, Margin_Change
         FROM earnings_tracker WHERE Target_Quarter = ?
     """, (TARGET_QUARTER,))
     rows = cursor.fetchall()
     conn.close()
-    
     return render_template_string(DASHBOARD_PAGE, rows=rows, target_quarter=TARGET_QUARTER)
+
+@app.route("/api/trigger-cron", methods=["GET"])
+def trigger_cron():
+    provided_key = request.args.get("key")
+    if provided_key != CRON_SECRET_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    def run_pipeline():
+        try:
+            fetch_new_bse_announcements()
+            process_pending_results()
+        except Exception as e:
+            print(f"Pipeline error: {e}")
+            
+    thread = threading.Thread(target=run_pipeline)
+    thread.start()
+    
+    return jsonify({"status": "success", "message": "Pipeline started in background."})
 
 # ==========================================
 # RUN LOGIC
 # ==========================================
 if __name__ == "__main__":
     init_db()
-    
-    # 1. Manual Delete Command
     if len(sys.argv) == 3 and sys.argv[1] == '--delete':
         delete_scrip_from_db(sys.argv[2])
         sys.exit(0)
-        
-    # 2. Local Testing Command
     elif len(sys.argv) == 4 and sys.argv[1] == '--test-dates':
-        print(f"--- RUNNING LOCAL TEST FOR {sys.argv[2]} to {sys.argv[3]} ---")
         fetch_new_bse_announcements(sys.argv[2], sys.argv[3])
         process_pending_results()
-        print("--- TEST COMPLETE ---")
-
-    # 3. Cron Job Command
     elif len(sys.argv) > 1 and sys.argv[1] == '--cron':
-        print("--- RUNNING SCHEDULED CRON JOB ---")
         fetch_new_bse_announcements()
         process_pending_results()
-    
-    # 4. Default: Launch the Web UI
     else:
-        print("--- STARTING WEB DASHBOARD ---")
-        app.run(debug=True, port=5001)
+        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
