@@ -19,7 +19,7 @@ load_dotenv()
 DB_FILE = "earnings_tracker.db"
 TELEGRAM_BOT_TOKEN = os.getenv("RESULT_BOT_TOKEN")
 TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-CRON_SECRET_KEY = os.getenv("CRON_SECRET_KEY", "my_super_secret_cron_key_123") # We will use this in Render
+CRON_SECRET_KEY = os.getenv("CRON_SECRET_KEY")
 
 app = Flask(__name__)
 app.secret_key = "super_secret_key_for_flask_flashes"
@@ -81,6 +81,7 @@ def delete_scrip_from_db(scrip_code):
     conn.close()
     if deleted > 0: print(f"✅ Successfully removed {scrip_code} from the tracking database.")
     else: print(f"⚠️ {scrip_code} was not found in the database.")
+    return deleted
 
 # ==========================================
 # 2. BSE FETCHING LOGIC
@@ -393,7 +394,37 @@ HTML_TEMPLATE = """
     <div class="max-w-7xl mx-auto mt-8 p-6 bg-white rounded-lg shadow-md">
         {% block content %}{% endblock %}
     </div>
-    <script>$(document).ready(function() { $('#dataTable').DataTable({"pageLength": 25, "order": [[ 4, "desc" ]]}); });</script>
+    <script>
+    $(document).ready(function() { 
+        var table = $('#dataTable').DataTable({"pageLength": 25, "order": [[ 4, "desc" ]]}); 
+        
+        // Handle delete button clicks using event delegation
+        $('#dataTable tbody').on('click', '.delete-btn', function() {
+            var scripCode = $(this).data('scrip');
+            var row = $(this).closest('tr');
+            
+            if(confirm('Are you sure you want to delete ' + scripCode + '?')) {
+                $.ajax({
+                    url: '/api/delete-scrip',
+                    type: 'DELETE',
+                    data: { scrip: scripCode },
+                    success: function(result) {
+                        if(result.status === 'success') {
+                            table.row(row).remove().draw();
+                            // Optional: Show a subtle success message
+                        } else {
+                            alert('Error: ' + result.message);
+                        }
+                    },
+                    error: function(xhr) {
+                        alert('Error deleting scrip. See console.');
+                        console.error(xhr.responseText);
+                    }
+                });
+            }
+        });
+    });
+    </script>
 </body>
 </html>
 """
@@ -414,6 +445,7 @@ DASHBOARD_PAGE = """
                 <th>Telegram</th>
                 <th>Sales YoY</th>
                 <th>PAT YoY</th>
+                <th>Action</th>
             </tr>
         </thead>
         <tbody>
@@ -492,6 +524,11 @@ DASHBOARD_PAGE = """
                         {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[7]|float) }}%</span>{% endif %}
                     {% else %}-{% endif %}
                 </td>
+                <td class="px-4 py-3 text-center">
+                    <button class="delete-btn text-red-500 hover:text-red-700 font-bold" data-scrip="{{ row[0] }}" title="Delete from tracker">
+                        🗑️
+                    </button>
+                </td>
             </tr>
             {% endfor %}
         </tbody>
@@ -523,9 +560,13 @@ def trigger_cron():
     if provided_key != CRON_SECRET_KEY:
         return jsonify({"error": "Unauthorized"}), 401
     
+    # We allow overriding dates through the webhook!
+    start_date = request.args.get("start")
+    end_date = request.args.get("end")
+    
     def run_pipeline():
         try:
-            fetch_new_bse_announcements()
+            fetch_new_bse_announcements(start_date, end_date)
             process_pending_results()
         except Exception as e:
             print(f"Pipeline error: {e}")
@@ -533,7 +574,27 @@ def trigger_cron():
     thread = threading.Thread(target=run_pipeline)
     thread.start()
     
-    return jsonify({"status": "success", "message": "Pipeline started in background."})
+    msg = f"Pipeline started. Fetching from {start_date or 'yesterday'} to {end_date or 'today'}."
+    return jsonify({"status": "success", "message": msg})
+
+@app.route("/api/delete-scrip", methods=["DELETE"])
+def api_delete_scrip():
+    provided_key = request.args.get("key")
+    if provided_key != CRON_SECRET_KEY:
+        return jsonify({"error": "Unauthorized"}), 401
+        
+    scrip_code = request.form.get("scrip")
+    if not scrip_code:
+         return jsonify({"status": "error", "message": "Scrip code not provided."}), 400
+         
+    try:
+        deleted = delete_scrip_from_db(scrip_code)
+        if deleted > 0:
+             return jsonify({"status": "success", "message": f"Successfully deleted {scrip_code}."})
+        else:
+             return jsonify({"status": "error", "message": f"Scrip {scrip_code} not found in DB."}), 404
+    except Exception as e:
+         return jsonify({"status": "error", "message": str(e)}), 500
 
 # ==========================================
 # RUN LOGIC
