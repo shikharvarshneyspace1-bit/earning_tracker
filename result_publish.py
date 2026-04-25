@@ -527,7 +527,7 @@ DASHBOARD_PAGE = """
                 <td class="px-4 py-3">
                     {% if row[3] == 'Excellent' %}<span class="px-2 py-1 bg-green-100 text-green-800 rounded">Excellent</span>
                     {% elif row[3] == 'Good' %}<span class="px-2 py-1 bg-blue-100 text-blue-800 rounded">Good</span>
-                    {% elif row[3] == 'Flat' %span class="px-2 py-1 bg-gray-100 text-gray-800 rounded">Flat</span>
+                    {% elif row[3] == 'Flat' %{<span class="px-2 py-1 bg-gray-100 text-gray-800 rounded">Flat</span>
                     {% elif row[3] == 'Bad' %}<span class="px-2 py-1 bg-red-100 text-red-800 rounded">Bad</span>
                     {% else %}-{% endif %}
                 </td>
