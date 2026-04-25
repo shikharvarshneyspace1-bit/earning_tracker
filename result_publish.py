@@ -417,22 +417,25 @@ HTML_TEMPLATE = """
     $(document).ready(function() { 
         var table = $('#dataTable').DataTable({"pageLength": 25, "order": [[ 4, "desc" ]]}); 
         
-        // Handle delete button clicks securely
+        // Handle delete button clicks securely with a prompt
         $('#dataTable tbody').on('click', '.delete-btn', function() {
             var scripCode = $(this).data('scrip');
             var row = $(this).closest('tr');
             
-            if(confirm('Are you sure you want to delete ' + scripCode + '?')) {
+            var enteredKey = prompt('Authentication required. Enter secret key to delete ' + scripCode + ':');
+            
+            if(enteredKey !== null && enteredKey.trim() !== "") {
                 $.ajax({
                     url: '/api/delete-scrip',
                     type: 'POST',
                     data: { 
                         scrip: scripCode,
-                        key: '{{ secret_key }}' // Injected securely via Jinja template
+                        key: enteredKey 
                     },
                     success: function(result) {
                         if(result.status === 'success') {
                             table.row(row).remove().draw();
+                            // Optional alert('Deleted successfully.');
                         } else {
                             alert('Error: ' + result.message);
                         }
@@ -572,7 +575,8 @@ def dashboard():
     """, (TARGET_QUARTER,))
     rows = cursor.fetchall()
     conn.close()
-    return render_template_string(DASHBOARD_PAGE, rows=rows, target_quarter=TARGET_QUARTER, secret_key=CRON_SECRET_KEY)
+    # Removed secret_key injection so the frontend is entirely secure
+    return render_template_string(DASHBOARD_PAGE, rows=rows, target_quarter=TARGET_QUARTER)
 
 @app.route("/api/trigger-cron", methods=["GET"])
 def trigger_cron():
