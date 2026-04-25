@@ -577,7 +577,7 @@ def trigger_cron():
     msg = f"Pipeline started. Fetching from {start_date or 'yesterday'} to {end_date or 'today'}."
     return jsonify({"status": "success", "message": msg})
 
-@app.route("/api/delete-scrip", methods=["DELETE"])
+@app.route("/api/delete-scrip", methods=["GET","DELETE"])
 def api_delete_scrip():
     provided_key = request.args.get("key")
     if provided_key != CRON_SECRET_KEY:
