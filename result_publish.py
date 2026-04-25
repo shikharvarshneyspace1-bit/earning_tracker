@@ -527,7 +527,7 @@ DASHBOARD_PAGE = """
                 <td class="px-4 py-3">
                     {% if row[3] == 'Excellent' %}<span class="px-2 py-1 bg-green-100 text-green-800 rounded">Excellent</span>
                     {% elif row[3] == 'Good' %}<span class="px-2 py-1 bg-blue-100 text-blue-800 rounded">Good</span>
-                    {% elif row[3] == 'Flat' %}<span class="px-2 py-1 bg-gray-100 text-gray-800 rounded">Flat</span>
+                    {% elif row[3] == 'Flat' %span class="px-2 py-1 bg-gray-100 text-gray-800 rounded">Flat</span>
                     {% elif row[3] == 'Bad' %}<span class="px-2 py-1 bg-red-100 text-red-800 rounded">Bad</span>
                     {% else %}-{% endif %}
                 </td>
@@ -587,6 +587,13 @@ def trigger_cron():
     start_date = request.args.get("start")
     end_date = request.args.get("end")
     
+    # Explicitly calculate dates if not provided
+    if not start_date or not end_date:
+        today = datetime.today()
+        yesterday = today - timedelta(days=1)
+        start_date = yesterday.strftime("%Y%m%d")
+        end_date = today.strftime("%Y%m%d")
+    
     def run_pipeline():
         try:
             fetch_new_bse_announcements(start_date, end_date)
@@ -597,7 +604,7 @@ def trigger_cron():
     thread = threading.Thread(target=run_pipeline)
     thread.start()
     
-    msg = f"Pipeline started. Fetching from {start_date or 'yesterday'} to {end_date or 'today'}."
+    msg = f"Pipeline started. Fetching from {start_date} to {end_date}."
     return jsonify({"status": "success", "message": msg})
 
 @app.route("/api/delete-scrip", methods=["GET", "POST", "DELETE"])
