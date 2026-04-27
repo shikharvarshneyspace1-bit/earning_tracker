@@ -49,10 +49,20 @@ def matches_target_quarter(headline, target_quarter):
     if not headline: return True
     hl_lower = headline.lower()
     month, year = target_quarter.split()
-    month_map = {"Mar": ["mar", "03"], "Jun": ["jun", "06"], "Sep": ["sep", "09"], "Dec": ["dec", "12"]}
+    
+    # Expanded aliases to catch '31.3.26', 'Q4', '4th quarter', 'year ended', etc.
+    month_map = {
+        "Mar": ["mar", "03", ".3.", "-3-", "/3/", "q4", "4th quarter", "fourth quarter", "year ended", "annual"], 
+        "Jun": ["jun", "06", ".6.", "-6-", "/6/", "q1", "1st quarter", "first quarter"], 
+        "Sep": ["sep", "09", ".9.", "-9-", "/9/", "q2", "2nd quarter", "second quarter", "half year"], 
+        "Dec": ["dec", "12", "q3", "3rd quarter", "third quarter", "nine month"]
+    }
     month_aliases = month_map.get(month, [month.lower()])
     has_month = any(m in hl_lower for m in month_aliases)
-    has_year = year in hl_lower
+    
+    # Check for full year "2026" or short year "26"
+    has_year = (year in hl_lower) or (year[-2:] in hl_lower)
+    
     if "result" in hl_lower and not (has_month and has_year): return False
     return True
 
@@ -63,7 +73,6 @@ def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
     
-    # Create main table if it doesn't exist
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS earnings_tracker (
             Scrip_Code TEXT, Company_Name TEXT, Target_Quarter TEXT, BSE_Announcement_Date TEXT, Headline TEXT,
@@ -73,7 +82,6 @@ def init_db():
         )
     ''')
     
-    # Safe migrations for columns (PostgreSQL syntax)
     cols = ['Headline', 'Attachment_Name', 'NSE_Symbol', 'Sales_CQ', 'Sales_PQ', 'Sales_YQ', 
             'PAT_CQ', 'PAT_PQ', 'PAT_YQ', 'Sales_QoQ', 'PAT_QoQ', 'Margin_QoQ', 
             'Margin_CQ', 'Margin_PQ', 'Margin_YQ', 'Margin_Name']
@@ -82,19 +90,20 @@ def init_db():
         try:
             cursor.execute(f"ALTER TABLE earnings_tracker ADD COLUMN IF NOT EXISTS {col} TEXT")
         except Exception:
-            conn.rollback() # Rollback required in postgres if an error occurs
+            conn.rollback()
 
     conn.commit()
     conn.close()
 
 def delete_scrip_from_db(scrip_code):
+    """Instead of actually deleting (which causes the scraper to re-fetch it), we softly mark it as Deleted."""
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = %s OR NSE_Symbol = %s", (str(scrip_code), str(scrip_code)))
+    cursor.execute("UPDATE earnings_tracker SET Telegram_Status = 'Deleted' WHERE Scrip_Code = %s OR NSE_Symbol = %s", (str(scrip_code), str(scrip_code)))
     deleted = cursor.rowcount
     conn.commit()
     conn.close()
-    if deleted > 0: print(f"✅ Successfully removed {scrip_code} from the tracking database.")
+    if deleted > 0: print(f"✅ Successfully hid {scrip_code} from the tracking database.")
     else: print(f"⚠️ {scrip_code} was not found in the database.")
     return deleted
 
@@ -136,7 +145,6 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
         return
 
     df_results = pd.DataFrame(all_announcements)
-    df_results = df_results.drop_duplicates(subset=['ATTACHMENTNAME']).copy()
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -344,9 +352,15 @@ def process_pending_results():
     for scrip, attachment, company_name in pending_stocks:
         data = scrape_screener(scrip)
         if check_screener_for_quarter(data, TARGET_QUARTER):
+            
+            # Soft Delete if Market Cap < 500 Cr
             if data.get('market_cap', 0) < 500:
-                print(f"⏳ Deleting {scrip}: Market Cap ({data.get('market_cap')} Cr) is below 500 Cr.")
-                cursor.execute("DELETE FROM earnings_tracker WHERE Scrip_Code = %s AND Target_Quarter = %s", (scrip, TARGET_QUARTER))
+                print(f"⏳ Filtering {scrip}: Market Cap ({data.get('market_cap')} Cr) is below 500 Cr.")
+                cursor.execute('''
+                    UPDATE earnings_tracker 
+                    SET Screener_Status = 'Available', Telegram_Status = 'Filtered (<500Cr)', Last_Checked = %s
+                    WHERE Scrip_Code = %s AND Target_Quarter = %s
+                ''', (datetime.now(), scrip, TARGET_QUARTER))
                 conn.commit()
                 time.sleep(2)
                 continue
@@ -417,7 +431,6 @@ HTML_TEMPLATE = """
     $(document).ready(function() { 
         var table = $('#dataTable').DataTable({"pageLength": 25, "order": [[ 4, "desc" ]]}); 
         
-        // Handle delete button clicks securely with a prompt
         $('#dataTable tbody').on('click', '.delete-btn', function() {
             var scripCode = $(this).data('scrip');
             var row = $(this).closest('tr');
@@ -435,7 +448,6 @@ HTML_TEMPLATE = """
                     success: function(result) {
                         if(result.status === 'success') {
                             table.row(row).remove().draw();
-                            // Optional alert('Deleted successfully.');
                         } else {
                             alert('Error: ' + result.message);
                         }
@@ -567,15 +579,16 @@ def dashboard():
     init_db()
     conn = get_db_connection()
     cursor = conn.cursor()
+    # Updated SQL to ignore our "Soft Deleted" stocks
     cursor.execute("""
         SELECT Scrip_Code, Company_Name, BSE_Announcement_Date, Rating, Screener_Status, Telegram_Status, 
                Sales_YoY, PAT_YoY, NSE_Symbol, Sales_CQ, Sales_PQ, Sales_YQ, PAT_CQ, PAT_PQ, PAT_YQ,
                Sales_QoQ, PAT_QoQ, Margin_QoQ, Margin_CQ, Margin_PQ, Margin_YQ, Margin_Name, Margin_Change
-        FROM earnings_tracker WHERE Target_Quarter = %s
+        FROM earnings_tracker 
+        WHERE Target_Quarter = %s AND Telegram_Status NOT IN ('Deleted', 'Filtered (<500Cr)')
     """, (TARGET_QUARTER,))
     rows = cursor.fetchall()
     conn.close()
-    # Removed secret_key injection so the frontend is entirely secure
     return render_template_string(DASHBOARD_PAGE, rows=rows, target_quarter=TARGET_QUARTER)
 
 @app.route("/api/trigger-cron", methods=["GET"])
@@ -587,7 +600,6 @@ def trigger_cron():
     start_date = request.args.get("start")
     end_date = request.args.get("end")
     
-    # Explicitly calculate dates if not provided
     if not start_date or not end_date:
         today = datetime.today()
         yesterday = today - timedelta(days=1)
