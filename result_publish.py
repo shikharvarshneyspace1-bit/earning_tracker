@@ -125,7 +125,7 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
         "Origin": "https://www.bseindia.com",
         "Referer": "https://www.bseindia.com/"
     }
-    params = {"strCat": "Result", "strPrevDate": start_date_str, "strScrip": "", "strSearch": "P", "strToDate": end_date_str, "strType": "C", "pageno": 1}
+    params = {"strCat": "Result", "subcategory": "Financial Results", "strPrevDate": start_date_str, "strScrip": "", "strSearch": "P", "strToDate": end_date_str, "strType": "C", "pageno": 1}
     all_announcements = []
     
     with requests.Session() as session:
