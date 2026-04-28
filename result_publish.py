@@ -125,7 +125,7 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
         "Origin": "https://www.bseindia.com",
         "Referer": "https://www.bseindia.com/"
     }
-    params = {"strCat": "Result", "subcategory": "Financial Results", "strPrevDate": start_date_str, "strScrip": "", "strSearch": "P", "strToDate": end_date_str, "strType": "C", "pageno": 1}
+    params = {"strCat": "Result", "strPrevDate": start_date_str, "strScrip": "", "strSearch": "P", "strToDate": end_date_str, "strType": "C", "pageno": 1}
     all_announcements = []
     
     with requests.Session() as session:
@@ -480,6 +480,8 @@ DASHBOARD_PAGE = """
                 <th>Telegram</th>
                 <th>Sales YoY</th>
                 <th>PAT YoY</th>
+                <th>Sales QoQ</th>
+                <th>PAT QoQ</th>
                 <th>Action</th>
             </tr>
         </thead>
@@ -545,18 +547,34 @@ DASHBOARD_PAGE = """
                 </td>
                 <td class="px-4 py-3">{{ row[4] }}</td>
                 <td class="px-4 py-3">{{ row[5] }}</td>
-                <td class="px-4 py-3 whitespace-nowrap">
+                
+                <!-- Added data-order to allow DataTables to sort correctly numerically -->
+                <td class="px-4 py-3 whitespace-nowrap" data-order="{{ row[6] if row[6] is not none else -999999 }}">
                     {% if row[6] is not none %}
                         {% if row[6]|float > 0 %}<span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[6]|float) }}%</span>
                         {% elif row[6]|float < 0 %}<span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[6]|float|abs) }}%</span>
                         {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[6]|float) }}%</span>{% endif %}
                     {% else %}-{% endif %}
                 </td>
-                <td class="px-4 py-3 whitespace-nowrap">
+                <td class="px-4 py-3 whitespace-nowrap" data-order="{{ row[7] if row[7] is not none else -999999 }}">
                     {% if row[7] is not none %}
                         {% if row[7]|float > 0 %}<span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[7]|float) }}%</span>
                         {% elif row[7]|float < 0 %}<span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[7]|float|abs) }}%</span>
                         {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[7]|float) }}%</span>{% endif %}
+                    {% else %}-{% endif %}
+                </td>
+                <td class="px-4 py-3 whitespace-nowrap" data-order="{{ row[15] if row[15] is not none else -999999 }}">
+                    {% if row[15] is not none %}
+                        {% if row[15]|float > 0 %}<span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[15]|float) }}%</span>
+                        {% elif row[15]|float < 0 %}<span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[15]|float|abs) }}%</span>
+                        {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[15]|float) }}%</span>{% endif %}
+                    {% else %}-{% endif %}
+                </td>
+                <td class="px-4 py-3 whitespace-nowrap" data-order="{{ row[16] if row[16] is not none else -999999 }}">
+                    {% if row[16] is not none %}
+                        {% if row[16]|float > 0 %}<span class="text-green-600 font-medium">▲ {{ "%.2f"|format(row[16]|float) }}%</span>
+                        {% elif row[16]|float < 0 %}<span class="text-red-600 font-medium">▼ {{ "%.2f"|format(row[16]|float|abs) }}%</span>
+                        {% else %}<span class="text-gray-600">{{ "%.2f"|format(row[16]|float) }}%</span>{% endif %}
                     {% else %}-{% endif %}
                 </td>
                 <td class="px-4 py-3 text-center">
