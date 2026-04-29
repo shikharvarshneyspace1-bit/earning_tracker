@@ -973,13 +973,20 @@ def dashboard():
         
         # Merge financial aggregates with Rating Counts
         sector_data = pd.merge(fin_agg, rating_pivot, on='Sector', how='left')
+        
+        # Fill any NaNs that occurred during merge to prevent float NaN to integer conversion errors
+        for cat in ['Excellent', 'Good', 'Flat', 'Bad']:
+            if cat in sector_data.columns:
+                sector_data[cat] = sector_data[cat].fillna(0)
 
         # Advanced Lenient Sector Rating Calculation & String Formatting
         def calculate_sector_metrics(r):
-            exc = int(r.get('Excellent', 0))
-            good = int(r.get('Good', 0))
-            flat = int(r.get('Flat', 0))
-            bad = int(r.get('Bad', 0))
+            # Safely handle NaNs during int conversion
+            exc = int(r.get('Excellent', 0) if pd.notna(r.get('Excellent', 0)) else 0)
+            good = int(r.get('Good', 0) if pd.notna(r.get('Good', 0)) else 0)
+            flat = int(r.get('Flat', 0) if pd.notna(r.get('Flat', 0)) else 0)
+            bad = int(r.get('Bad', 0) if pd.notna(r.get('Bad', 0)) else 0)
+            
             total = exc + good + flat + bad
             
             # Formatted strings with percentages
