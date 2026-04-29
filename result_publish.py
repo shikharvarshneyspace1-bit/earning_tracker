@@ -182,48 +182,68 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
 # 3. SCREENER SCRAPING (IN-MEMORY)
 # ==========================================
 def scrape_screener(ticker_code):
-    url = f"https://www.screener.in/company/{ticker_code}/"
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code != 200: return None
-        soup = BeautifulSoup(response.text, 'html.parser')
-        data = {"ticker_bse": ticker_code, "last_scraped": str(pd.Timestamp.now())}
 
-        name_div = soup.find('h1')
-        data['company_name'] = name_div.text.strip() if name_div else "Unknown"
-
+    def fetch_url(url):
         try:
-            top_links = soup.find('div', class_='company-links')
-            if top_links:
-                nse_span = top_links.find('span', string=lambda t: t and 'NSE' in t)
-                if nse_span: data['nse_symbol'] = nse_span.text.replace('NSE:', '').strip()
-        except Exception: data['nse_symbol'] = None
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code != 200: return None
+            soup = BeautifulSoup(response.text, 'html.parser')
+            data = {"ticker_bse": ticker_code, "last_scraped": str(pd.Timestamp.now())}
 
-        try:
-            mcap = 0.0
-            top_ratios = soup.find('ul', id='top-ratios')
-            if top_ratios:
-                for li in top_ratios.find_all('li'):
-                    name_span = li.find('span', class_='name')
-                    num_span = li.find('span', class_='number')
-                    if name_span and num_span and 'Market Cap' in name_span.text:
-                        mcap = float(num_span.text.replace(',', '').strip())
-                        break
-            data['market_cap'] = mcap
-        except Exception: data['market_cap'] = 0.0
+            name_div = soup.find('h1')
+            data['company_name'] = name_div.text.strip() if name_div else "Unknown"
 
-        sections = ['quarters', 'profit-loss', 'balance-sheet', 'cash-flow', 'ratios', 'shareholding']
-        for sid in sections:
-            section = soup.find('section', id=sid)
-            if section:
-                table = section.find('table', class_='data-table')
-                if table:
-                    headers = [th.text.strip() for th in table.find_all('th') if th.text.strip()]
-                    rows = [[td.text.strip() for td in tr.find_all('td')] for tr in table.find_all('tr') if tr.find_all('td')]
-                    data[f'{sid}_table'] = {"headers": headers, "rows": rows}
-        return data 
-    except Exception: return None
+            try:
+                top_links = soup.find('div', class_='company-links')
+                if top_links:
+                    nse_span = top_links.find('span', string=lambda t: t and 'NSE' in t)
+                    if nse_span: data['nse_symbol'] = nse_span.text.replace('NSE:', '').strip()
+            except Exception: data['nse_symbol'] = None
+
+            try:
+                mcap = 0.0
+                top_ratios = soup.find('ul', id='top-ratios')
+                if top_ratios:
+                    for li in top_ratios.find_all('li'):
+                        name_span = li.find('span', class_='name')
+                        num_span = li.find('span', class_='number')
+                        if name_span and num_span and 'Market Cap' in name_span.text:
+                            mcap = float(num_span.text.replace(',', '').strip())
+                            break
+                data['market_cap'] = mcap
+            except Exception: data['market_cap'] = 0.0
+
+            sections = ['quarters', 'profit-loss', 'balance-sheet', 'cash-flow', 'ratios', 'shareholding']
+            for sid in sections:
+                section = soup.find('section', id=sid)
+                if section:
+                    table = section.find('table', class_='data-table')
+                    if table:
+                        th_elements = table.find_all('th')
+                        if not th_elements: continue
+                        table_headers = [th.text.strip() for th in th_elements if th.text.strip()]
+                        rows = [[td.text.strip() for td in tr.find_all('td')] for tr in table.find_all('tr') if tr.find_all('td')]
+                        data[f'{sid}_table'] = {"headers": table_headers, "rows": rows}
+            
+            # Check if valid financial table was scraped
+            if 'quarters_table' in data:
+                return data
+            return None
+        except Exception as e: 
+            print(f"[{ticker_code}] Error parsing {url}: {e}")
+            return None
+
+    # First attempt: Try to fetch consolidated results
+    cons_url = f"https://www.screener.in/company/{ticker_code}/consolidated/"
+    data = fetch_url(cons_url)
+    
+    if data:
+        return data
+        
+    # Second attempt: Fallback to standalone results
+    std_url = f"https://www.screener.in/company/{ticker_code}/"
+    return fetch_url(std_url)
 
 def check_screener_for_quarter(data, target_quarter):
     if not data or 'quarters_table' not in data: return False
@@ -1091,6 +1111,7 @@ def manual_fetch():
          return jsonify({"status": "error", "message": "Scrip code not provided."}), 400
          
     scrip_code = scrip_code.upper().strip()
+    current_date_str = datetime.now().strftime('%Y-%m-%d')
     
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -1122,7 +1143,7 @@ def manual_fetch():
             INSERT INTO earnings_tracker (Scrip_Code, Company_Name, Target_Quarter, BSE_Announcement_Date, Headline, Attachment_Name, Screener_Status, Telegram_Status, Last_Checked)
             VALUES (%s, %s, %s, %s, %s, %s, 'Available', 'Filtered (<500Cr)', %s)
             ON CONFLICT (Scrip_Code, Target_Quarter) DO UPDATE SET Screener_Status='Available', Telegram_Status='Filtered (<500Cr)', Last_Checked=%s
-        ''', (scrip_code, company_name, TARGET_QUARTER, 'Manual', 'Manual Override', '', datetime.now(), datetime.now()))
+        ''', (scrip_code, company_name, TARGET_QUARTER, current_date_str, 'Manual Override', '', datetime.now(), datetime.now()))
         conn.commit()
         conn.close()
         return jsonify({"status": "info", "message": f"Results bypassed: {company_name} Market Cap is < 500 Cr."})
@@ -1155,7 +1176,7 @@ def manual_fetch():
                 PAT_CQ = EXCLUDED.PAT_CQ, PAT_PQ = EXCLUDED.PAT_PQ, PAT_YQ = EXCLUDED.PAT_YQ,
                 Sales_QoQ = EXCLUDED.Sales_QoQ, PAT_QoQ = EXCLUDED.PAT_QoQ, Margin_QoQ = EXCLUDED.Margin_QoQ,
                 Margin_CQ = EXCLUDED.Margin_CQ, Margin_PQ = EXCLUDED.Margin_PQ, Margin_YQ = EXCLUDED.Margin_YQ, Margin_Name = EXCLUDED.Margin_Name
-        ''', (scrip_code, company_name, TARGET_QUARTER, 'Manual', 'Manual Override Fetch', '', 
+        ''', (scrip_code, company_name, TARGET_QUARTER, current_date_str, 'Manual Override Fetch', '', 
               metrics['Rating'], metrics['Sales_YoY'], metrics['PAT_YoY'], metrics['Margin_YoY'], datetime.now(), nse_symbol,
               metrics.get('Sales_CQ'), metrics.get('Sales_PQ'), metrics.get('Sales_YQ'), 
               metrics.get('PAT_CQ'), metrics.get('PAT_PQ'), metrics.get('PAT_YQ'), 
