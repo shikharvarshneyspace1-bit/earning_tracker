@@ -7,6 +7,7 @@ import time
 from datetime import datetime, timedelta
 import sys
 import threading
+import re  # Added for URL parsing
 from flask import Flask, render_template_string, request, jsonify
 from jinja2 import DictLoader, ChoiceLoader
 from dotenv import load_dotenv
@@ -181,7 +182,7 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
 # ==========================================
 # 3. SCREENER SCRAPING (IN-MEMORY)
 # ==========================================
-def scrape_screener(ticker_code):
+def scrape_screener(ticker_code, target_quarter=None):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
     def fetch_url(url):
@@ -236,14 +237,30 @@ def scrape_screener(ticker_code):
 
     # First attempt: Try to fetch consolidated results
     cons_url = f"https://www.screener.in/company/{ticker_code}/consolidated/"
-    data = fetch_url(cons_url)
+    cons_data = fetch_url(cons_url)
     
-    if data:
-        return data
-        
+    # If we have a target_quarter, strictly check if the consolidated page has it
+    if target_quarter and cons_data and 'quarters_table' in cons_data:
+        if target_quarter in cons_data['quarters_table']['headers']:
+            return cons_data
+            
     # Second attempt: Fallback to standalone results
+    # (Triggered if consolidated is missing OR if consolidated is outdated)
     std_url = f"https://www.screener.in/company/{ticker_code}/"
-    return fetch_url(std_url)
+    std_data = fetch_url(std_url)
+    
+    if target_quarter and std_data and 'quarters_table' in std_data:
+        if target_quarter in std_data['quarters_table']['headers']:
+            return std_data
+            
+    # If neither has the target quarter yet, return whichever valid table we found
+    # so that the downstream 'Not yet available' logic handles it gracefully.
+    if cons_data:
+        return cons_data
+    if std_data:
+        return std_data
+        
+    return None
 
 def check_screener_for_quarter(data, target_quarter):
     if not data or 'quarters_table' not in data: return False
@@ -378,7 +395,8 @@ def process_pending_results():
     pending_stocks = cursor.fetchall()
     
     for scrip, attachment, company_name in pending_stocks:
-        data = scrape_screener(scrip)
+        # Pass TARGET_QUARTER down to ensure outdated consolidated pages trigger the fallback
+        data = scrape_screener(scrip, TARGET_QUARTER)
         if check_screener_for_quarter(data, TARGET_QUARTER):
             
             # Soft Delete if Market Cap < 500 Cr
@@ -587,7 +605,6 @@ DASHBOARD_PAGE = """
 {% extends "base" %}
 {% block content %}
 
-<!-- Tabs Navigation -->
 <div class="border-b border-gray-200 mb-6">
     <ul class="flex flex-wrap -mb-px text-sm font-medium text-center text-gray-500">
         <li class="mr-2">
@@ -605,7 +622,6 @@ DASHBOARD_PAGE = """
     </ul>
 </div>
 
-<!-- TAB 1: Main Tracker -->
 <div id="tab-tracker" class="tab-content block">
     <div class="flex justify-between items-center mb-6">
         <h2 class="text-xl font-bold text-gray-800">Tracked Announcements ({{ target_quarter }})</h2>
@@ -735,7 +751,6 @@ DASHBOARD_PAGE = """
     </div>
 </div>
 
-<!-- TAB 2: Sector View -->
 <div id="tab-sector" class="tab-content hidden">
     <div id="sectorFinContainer">
         <h2 class="text-xl font-bold text-gray-800 mb-4">Financial Aggregates & Ratings by Sector</h2>
@@ -790,7 +805,6 @@ DASHBOARD_PAGE = """
     </div>
 </div>
 
-<!-- TAB 3: Sector Mapping -->
 <div id="tab-mapping" class="tab-content hidden">
     <div class="flex justify-between items-center mb-6">
         <h2 class="text-xl font-bold text-gray-800">Company to Sector Mappings</h2>
@@ -827,9 +841,7 @@ DASHBOARD_PAGE = """
     </div>
 </div>
 
-<!-- TAB 4: Rating Methodology -->
 <div id="tab-methodology" class="tab-content hidden">
-    <!-- Company Logic -->
     <div class="bg-white rounded-lg p-6 mb-6 shadow-sm border border-gray-100">
         <h3 class="text-lg font-bold text-gray-800 mb-4 border-b pb-2">🏢 Individual Company Rating Logic</h3>
         <p class="text-sm text-gray-600 mb-6">Results are systematically analyzed and categorized into <strong>Excellent</strong>, <strong>Good</strong>, <strong>Flat</strong>, or <strong>Bad</strong> based on the following criteria evaluation.</p>
@@ -873,7 +885,6 @@ DASHBOARD_PAGE = """
         </div>
     </div>
 
-    <!-- Sector Logic -->
     <div class="bg-blue-50 rounded-lg p-6 shadow-sm border border-blue-100">
         <h3 class="text-lg font-bold text-blue-900 mb-4 border-b border-blue-200 pb-2">🌐 Lenient & Proportionate Sector Rating Logic</h3>
         <p class="text-sm text-gray-700 mb-6">Sector ratings balance aggregated financial sums with the proportion of underlying companies performing well, ensuring a single bad company does not drag down the entire sector.</p>
@@ -1110,6 +1121,11 @@ def manual_fetch():
     if not scrip_code:
          return jsonify({"status": "error", "message": "Scrip code not provided."}), 400
          
+    # Clean up URL if a user pastes a full Screener URL instead of just the ticker
+    match = re.search(r'screener\.in/company/([^/]+)', scrip_code, re.IGNORECASE)
+    if match:
+        scrip_code = match.group(1)
+        
     scrip_code = scrip_code.upper().strip()
     current_date_str = datetime.now().strftime('%Y-%m-%d')
     
@@ -1124,8 +1140,8 @@ def manual_fetch():
         conn.close()
         return jsonify({"status": "info", "message": f"{scrip_code} results are already published in the tracker!"})
 
-    # 2. Scrape Screener directly
-    data = scrape_screener(scrip_code)
+    # 2. Scrape Screener directly (Passing TARGET_QUARTER ensures outdated fallback works)
+    data = scrape_screener(scrip_code, TARGET_QUARTER)
     if not data:
         conn.close()
         return jsonify({"status": "error", "message": f"Could not find valid company data for '{scrip_code}' on Screener.in."})
