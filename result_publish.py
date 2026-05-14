@@ -184,6 +184,7 @@ def fetch_new_bse_announcements(start_date_str=None, end_date_str=None):
 # ==========================================
 def scrape_screener(ticker_code, target_quarter=None):
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    print("Scraping Screener for ticker:", ticker_code)
 
     def fetch_url(url):
         try:
@@ -279,26 +280,40 @@ def evaluate_financials(data):
         
     headers = data['quarters_table']['headers']
     rows = data['quarters_table']['rows']
-    CQ_idx = -1; PQ_idx = -2; YQ_idx = -5 
+    
+    if not headers or len(headers) == 0: return None
+    
+    # Safe indices for recently listed companies (IPO / SME)
+    CQ_idx = -1
+    PQ_idx = -2 if len(headers) >= 2 else None
+    YQ_idx = -5 if len(headers) >= 5 else None 
     
     metrics = {'Company': data.get('company_name', 'Unknown'), 'Quarter': headers[CQ_idx], 'Margin_Name': 'OPM'}
     metrics['PBT_CQ'] = 0.0; metrics['PBT_PQ'] = 0.0; metrics['PBT_YQ'] = 0.0; metrics['Tax_CQ'] = 0.0
     
+    # Helper to prevent list index out of range for missing historical columns
+    def safe_get(lst, idx):
+        if idx is None: return 0.0
+        try:
+            return clean_num(lst[idx])
+        except IndexError:
+            return 0.0
+            
     for row in rows:
         if not row: continue
         label = str(row[0]).replace('\xa0+', '').strip()
         
         if 'Sales' in label or 'Revenue' in label:
-            metrics['Sales_CQ'] = clean_num(row[CQ_idx]); metrics['Sales_PQ'] = clean_num(row[PQ_idx]); metrics['Sales_YQ'] = clean_num(row[YQ_idx])
+            metrics['Sales_CQ'] = safe_get(row, CQ_idx); metrics['Sales_PQ'] = safe_get(row, PQ_idx); metrics['Sales_YQ'] = safe_get(row, YQ_idx)
         elif 'OPM %' in label or 'Financing Margin %' in label:
             metrics['Margin_Name'] = 'Fin Margin' if 'Financing' in label else 'OPM'
-            metrics['Margin_CQ'] = clean_num(row[CQ_idx]); metrics['Margin_PQ'] = clean_num(row[PQ_idx]); metrics['Margin_YQ'] = clean_num(row[YQ_idx])
+            metrics['Margin_CQ'] = safe_get(row, CQ_idx); metrics['Margin_PQ'] = safe_get(row, PQ_idx); metrics['Margin_YQ'] = safe_get(row, YQ_idx)
         elif 'Profit before tax' in label:
-            metrics['PBT_CQ'] = clean_num(row[CQ_idx]); metrics['PBT_PQ'] = clean_num(row[PQ_idx]); metrics['PBT_YQ'] = clean_num(row[YQ_idx])
+            metrics['PBT_CQ'] = safe_get(row, CQ_idx); metrics['PBT_PQ'] = safe_get(row, PQ_idx); metrics['PBT_YQ'] = safe_get(row, YQ_idx)
         elif 'Net Profit' in label:
-            metrics['PAT_CQ'] = clean_num(row[CQ_idx]); metrics['PAT_PQ'] = clean_num(row[PQ_idx]); metrics['PAT_YQ'] = clean_num(row[YQ_idx])
+            metrics['PAT_CQ'] = safe_get(row, CQ_idx); metrics['PAT_PQ'] = safe_get(row, PQ_idx); metrics['PAT_YQ'] = safe_get(row, YQ_idx)
         elif 'Tax %' in label:
-            metrics['Tax_CQ'] = clean_num(row[CQ_idx])
+            metrics['Tax_CQ'] = safe_get(row, CQ_idx)
             
     def calc_growth(current, past):
         if past == 0: return 100.0 if current > 0 else 0.0
@@ -393,49 +408,56 @@ def process_pending_results():
     cursor = conn.cursor()
     cursor.execute("SELECT Scrip_Code, Attachment_Name, Company_Name FROM earnings_tracker WHERE Target_Quarter = %s AND Telegram_Status = 'Unsent'", (TARGET_QUARTER,))
     pending_stocks = cursor.fetchall()
+    print(f"Found {len(pending_stocks)} pending results to process.")
     
+    # MOVED TRY/EXCEPT INSIDE THE LOOP: 
+    # If one stock crashes, it logs it and continues parsing the rest of the queue.
     for scrip, attachment, company_name in pending_stocks:
-        # Pass TARGET_QUARTER down to ensure outdated consolidated pages trigger the fallback
-        data = scrape_screener(scrip, TARGET_QUARTER)
-        if check_screener_for_quarter(data, TARGET_QUARTER):
-            
-            # Soft Delete if Market Cap < 500 Cr
-            if data.get('market_cap', 0) < 500:
-                print(f"⏳ Filtering {scrip}: Market Cap ({data.get('market_cap')} Cr) is below 500 Cr.")
-                cursor.execute('''
-                    UPDATE earnings_tracker 
-                    SET Screener_Status = 'Available', Telegram_Status = 'Filtered (<500Cr)', Last_Checked = %s
-                    WHERE Scrip_Code = %s AND Target_Quarter = %s
-                ''', (datetime.now(), scrip, TARGET_QUARTER))
-                conn.commit()
-                time.sleep(2)
-                continue
-
-            nse_symbol = data.get('nse_symbol')
-            metrics = evaluate_financials(data)
-            
-            if metrics:
-                msg = format_telegram_alert(metrics, company_name, nse_symbol, attachment)
-                if send_to_telegram(msg, scrip, nse_symbol):
+        try:
+            # Pass TARGET_QUARTER down to ensure outdated consolidated pages trigger the fallback
+            data = scrape_screener(scrip, TARGET_QUARTER)
+            if check_screener_for_quarter(data, TARGET_QUARTER):
+                
+                # Soft Delete if Market Cap < 500 Cr
+                if data.get('market_cap', 0) < 500:
+                    print(f"⏳ Filtering {scrip}: Market Cap ({data.get('market_cap')} Cr) is below 500 Cr.")
                     cursor.execute('''
                         UPDATE earnings_tracker 
-                        SET Screener_Status = 'Available', Telegram_Status = 'Sent',
-                            Rating = %s, Sales_YoY = %s, PAT_YoY = %s, Margin_Change = %s, Last_Checked = %s, NSE_Symbol = %s,
-                            Sales_CQ = %s, Sales_PQ = %s, Sales_YQ = %s, PAT_CQ = %s, PAT_PQ = %s, PAT_YQ = %s,
-                            Sales_QoQ = %s, PAT_QoQ = %s, Margin_QoQ = %s, Margin_CQ = %s, Margin_PQ = %s, Margin_YQ = %s, Margin_Name = %s
+                        SET Screener_Status = 'Available', Telegram_Status = 'Filtered (<500Cr)', Last_Checked = %s
                         WHERE Scrip_Code = %s AND Target_Quarter = %s
-                    ''', (metrics['Rating'], metrics['Sales_YoY'], metrics['PAT_YoY'], 
-                          metrics['Margin_YoY'], datetime.now(), nse_symbol, 
-                          metrics.get('Sales_CQ'), metrics.get('Sales_PQ'), metrics.get('Sales_YQ'), 
-                          metrics.get('PAT_CQ'), metrics.get('PAT_PQ'), metrics.get('PAT_YQ'), 
-                          metrics.get('Sales_QoQ'), metrics.get('PAT_QoQ'), metrics.get('Margin_QoQ'),
-                          metrics.get('Margin_CQ'), metrics.get('Margin_PQ'), metrics.get('Margin_YQ'),
-                          metrics.get('Margin_Name'), scrip, TARGET_QUARTER))
+                    ''', (datetime.now(), scrip, TARGET_QUARTER))
                     conn.commit()
-        else:
-            cursor.execute("UPDATE earnings_tracker SET Last_Checked = %s WHERE Scrip_Code = %s AND Target_Quarter = %s", (datetime.now(), scrip, TARGET_QUARTER))
-            conn.commit()
-        time.sleep(2) 
+                    time.sleep(2)
+                    continue
+
+                nse_symbol = data.get('nse_symbol')
+                metrics = evaluate_financials(data)
+                
+                if metrics:
+                    msg = format_telegram_alert(metrics, company_name, nse_symbol, attachment)
+                    if send_to_telegram(msg, scrip, nse_symbol):
+                        cursor.execute('''
+                            UPDATE earnings_tracker 
+                            SET Screener_Status = 'Available', Telegram_Status = 'Sent',
+                                Rating = %s, Sales_YoY = %s, PAT_YoY = %s, Margin_Change = %s, Last_Checked = %s, NSE_Symbol = %s,
+                                Sales_CQ = %s, Sales_PQ = %s, Sales_YQ = %s, PAT_CQ = %s, PAT_PQ = %s, PAT_YQ = %s,
+                                Sales_QoQ = %s, PAT_QoQ = %s, Margin_QoQ = %s, Margin_CQ = %s, Margin_PQ = %s, Margin_YQ = %s, Margin_Name = %s
+                            WHERE Scrip_Code = %s AND Target_Quarter = %s
+                        ''', (metrics['Rating'], metrics['Sales_YoY'], metrics['PAT_YoY'], 
+                            metrics['Margin_YoY'], datetime.now(), nse_symbol, 
+                            metrics.get('Sales_CQ'), metrics.get('Sales_PQ'), metrics.get('Sales_YQ'), 
+                            metrics.get('PAT_CQ'), metrics.get('PAT_PQ'), metrics.get('PAT_YQ'), 
+                            metrics.get('Sales_QoQ'), metrics.get('PAT_QoQ'), metrics.get('Margin_QoQ'),
+                            metrics.get('Margin_CQ'), metrics.get('Margin_PQ'), metrics.get('Margin_YQ'),
+                            metrics.get('Margin_Name'), scrip, TARGET_QUARTER))
+                        conn.commit()
+            else:
+                cursor.execute("UPDATE earnings_tracker SET Last_Checked = %s WHERE Scrip_Code = %s AND Target_Quarter = %s", (datetime.now(), scrip, TARGET_QUARTER))
+                conn.commit()
+            time.sleep(2) 
+        except Exception as e:
+            print(f"Error processing stock {scrip}: {e}")
+            
     conn.close()
 
 # ==========================================
@@ -1284,4 +1306,4 @@ if __name__ == "__main__":
         fetch_new_bse_announcements()
         process_pending_results()
     else:
-        app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+        app.run(host="0.0.0.0", debug=True, port=int(os.environ.get("PORT", 5000)))
